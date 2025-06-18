@@ -94,7 +94,7 @@ class Dialects(str, Enum):
     TABLEAU = "tableau"
     TERADATA = "teradata"
     TRINO = "trino"
-    TSQL = "tsql",
+    TSQL = "tsql"
     FABRIC = "fabric"
 
 

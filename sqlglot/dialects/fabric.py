@@ -22,6 +22,19 @@ class Fabric(TSQL):
     NORMALIZATION_STRATEGY = NormalizationStrategy.CASE_SENSITIVE
 
     class Generator(TSQL.Generator):
+        TYPE_MAPPING = {
+            **TSQL.Generator.TYPE_MAPPING,
+            exp.DataType.Type.TINYINT: "SMALLINT",
+            exp.DataType.Type.DATETIME: "DATETIME2",
+            exp.DataType.Type.SMALLDATETIME: "DATETIME2",
+            exp.DataType.Type.NCHAR: "CHAR",
+            exp.DataType.Type.NVARCHAR: "VARCHAR",
+            exp.DataType.Type.TEXT: "VARCHAR",
+            exp.DataType.Type.IMAGE: "VARBINARY",
+            exp.DataType.Type.MONEY: "DECIMAL",
+            exp.DataType.Type.SMALLMONEY: "DECIMAL",
+        }
+
         def datatype_sql(self, expression: exp.DataType) -> str:
             """
             Forces a precision of 6 for temporal types, as Fabric does not
@@ -29,14 +42,15 @@ class Fabric(TSQL):
             """
             type_sql = super().datatype_sql(expression)
 
-            if type_sql.upper() in ("DATETIME2", "DATETIMEOFFSET"):
+            # The 'time' type is also limited to 6 digits of precision
+            if type_sql.upper() in ("DATETIME2", "DATETIMEOFFSET", "TIME"):
                 if "(" in type_sql:
                     return f"{type_sql.split('(')[0]}(6)"
                 return f"{type_sql}(6)"
 
             return type_sql
 
-        def table_sql(self, expression: exp.Table, sep: str = "") -> str:
+        def table_sql(self, expression: exp.Table, sep: str = ".") -> str:
             """Handles special quoting and casing for INFORMATION_SCHEMA views."""
             if isinstance(expression.db, exp.Identifier) and isinstance(
                 expression.this, exp.Identifier
@@ -54,8 +68,11 @@ class Fabric(TSQL):
                             f"Cannot generate fully qualified name for '{expression.sql(dialect='tsql')}' in Fabric dialect: "
                             "Database (catalog) name is missing."
                         )
+                        # Let the parent handle it, but it will likely be incorrect for the engine
                         return super().table_sql(expression, sep=sep)
 
+                    # For this specific case, we build the string manually to ensure correct quoting and casing.
+                    # The T-SQL generator would normally handle this, but we need to enforce our specific rules.
                     catalog_sql = self.sql(expression.catalog)
                     schema_sql = self.quote("INFORMATION_SCHEMA")
                     table_sql = self.quote(table_name.upper())
@@ -124,7 +141,6 @@ class Fabric(TSQL):
             if not expression.args.get("exists"):
                 return super().create_sql(expression)
 
-            # Fabric doesn't support IF NOT EXISTS
             create_expression = expression.copy()
             create_expression.args.pop("exists")
 

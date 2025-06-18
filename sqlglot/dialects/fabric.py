@@ -1,24 +1,24 @@
 from __future__ import annotations
 
 import logging
+import typing as t
 
 from sqlglot import exp
 from sqlglot.dialects.tsql import TSQL
 from sqlglot.dialects.dialect import NormalizationStrategy
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("sqlglot")
 
 
-class FABRIC(TSQL):
+class Fabric(TSQL):
     """
     Microsoft Fabric Warehouse Dialect.
 
     Inherits from TSQL and enforces correct casing and database qualification
     for INFORMATION_SCHEMA system views, which is a common requirement
-    in Fabric Warehouses. SQLMesh will load this dialect from the project path.
+    in Fabric Warehouses.
     """
 
-    DIALECT = "fabric"
     NORMALIZATION_STRATEGY = NormalizationStrategy.CASE_SENSITIVE
 
     class Generator(TSQL.Generator):
@@ -27,7 +27,6 @@ class FABRIC(TSQL):
             Forces a precision of 6 for temporal types, as Fabric does not
             support the default T-SQL precision of 7 in CAST statements.
             """
-
             type_sql = super().datatype_sql(expression)
 
             if type_sql.upper() in ("DATETIME2", "DATETIMEOFFSET"):
@@ -37,197 +36,112 @@ class FABRIC(TSQL):
 
             return type_sql
 
-        def table_sql(self, expression: exp.Table, sep: str = ".") -> str:
-            catalog = expression.catalog
-            schema = expression.db
-            table = expression.this
-
-            schema_name_str = None
-            if schema is not None:
-                try:
-                    schema_name_str = exp.to_identifier(schema).name
-                except Exception as e:
-                    logger.warning(
-                        f"Could not get name from schema part '{schema}' (type: {type(schema)}) in table '{expression}'. Error: {e}"
-                    )
-
-            if (
-                schema_name_str is not None
-                and schema_name_str.upper() == "INFORMATION_SCHEMA"
-                and table
-                and table.name
-                and table.name.upper() in ("TABLES", "SCHEMATA", "COLUMNS")
+        def table_sql(self, expression: exp.Table, sep: str = "") -> str:
+            """Handles special quoting and casing for INFORMATION_SCHEMA views."""
+            if isinstance(expression.db, exp.Identifier) and isinstance(
+                expression.this, exp.Identifier
             ):
-                if catalog:
-                    catalog_sql = self.sql(catalog)
-                    schema_sql = self.dialect.quote_identifier("INFORMATION_SCHEMA")
-                    table_sql = self.dialect.quote_identifier(table.name.upper())
+                db_name = expression.db.name
+                table_name = expression.this.name
 
-                    return f"{catalog_sql}.{schema_sql}.{table_sql}"
-                else:
-                    logger.error(
-                        f"Cannot generate fully qualified name for '{expression.sql(dialect='tsql')}' in Fabric dialect: Database (catalog) name is missing."
+                if db_name.upper() == "INFORMATION_SCHEMA" and table_name.upper() in (
+                    "TABLES",
+                    "SCHEMATA",
+                    "COLUMNS",
+                ):
+                    if not expression.catalog:
+                        logger.warning(
+                            f"Cannot generate fully qualified name for '{expression.sql(dialect='tsql')}' in Fabric dialect: "
+                            "Database (catalog) name is missing."
+                        )
+                        return super().table_sql(expression, sep=sep)
+
+                    catalog_sql = self.sql(expression.catalog)
+                    schema_sql = self.quote("INFORMATION_SCHEMA")
+                    table_sql = self.quote(table_name.upper())
+                    return f"{catalog_sql}{sep}{schema_sql}{sep}{table_sql}"
+
+            return super().table_sql(expression, sep=sep)
+
+        def _create_if_not_exists_check(self, expression: exp.Create) -> t.Optional[exp.Select]:
+            """Builds the SELECT query used to check for an object's existence."""
+            kind = (expression.kind or "").upper()
+            target = expression.this
+
+            catalog = getattr(target, "catalog", None)
+            if not isinstance(catalog, exp.Identifier):
+                return None
+            catalog_name = catalog.name
+
+            if kind == "SCHEMA" and isinstance(target, exp.Identifier):
+                return (
+                    exp.select("1")
+                    .from_(exp.table_("SCHEMATA", db="INFORMATION_SCHEMA", catalog=catalog_name))
+                    .where(exp.column("SCHEMA_NAME").eq(target.name))
+                )
+
+            table = getattr(target, "this", None)
+            if kind == "TABLE" and isinstance(table, exp.Identifier):
+                db = getattr(target, "db", None)
+                where_clauses = [exp.column("TABLE_NAME").eq(table.name)]
+                if isinstance(db, exp.Identifier):
+                    where_clauses.append(exp.column("TABLE_SCHEMA").eq(db.name))
+
+                return (
+                    exp.select("1")
+                    .from_(exp.table_("TABLES", db="INFORMATION_SCHEMA", catalog=catalog_name))
+                    .where(exp.and_(*where_clauses))
+                )
+
+            if kind == "INDEX" and isinstance(target, exp.Identifier):
+                on_table = expression.find(exp.Table)
+                if not (on_table and isinstance(on_table.this, exp.Identifier)):
+                    return None
+
+                table_catalog = on_table.catalog or catalog
+                if not isinstance(table_catalog, exp.Identifier):
+                    return None
+
+                table_db = on_table.db
+                schema_name = table_db.name if isinstance(table_db, exp.Identifier) else "dbo"
+                qualified_name = f"{table_catalog.name}.{schema_name}.{on_table.this.name}"
+
+                object_id_func = exp.func("OBJECT_ID", exp.Literal.string(qualified_name))
+
+                return (
+                    exp.select("1")
+                    .from_(exp.table_("indexes", db="sys", catalog=table_catalog.name))
+                    .where(
+                        exp.and_(
+                            exp.column("object_id").eq(object_id_func),
+                            exp.column("name").eq(target.name),
+                        )
                     )
-
-            return super().table_sql(expression)
+                )
+            return None
 
         def create_sql(self, expression: exp.Create) -> str:
-            exists = expression.args.pop("exists", None)
+            if not expression.args.get("exists"):
+                return super().create_sql(expression)
 
-            target = expression.this
-            kind = expression.kind.upper() if expression.kind is not None else ""
+            # Fabric doesn't support IF NOT EXISTS
+            create_expression = expression.copy()
+            create_expression.args.pop("exists")
 
-            table_name_exp = target.this if isinstance(target, exp.Schema) else target
+            check_sql = self._create_if_not_exists_check(create_expression)
+            if not check_sql:
+                kind = (create_expression.kind or "OBJECT").upper()
+                target_sql = create_expression.this.sql(dialect="tsql")
+                logger.warning(
+                    f"Could not build IF NOT EXISTS check for {kind} {target_sql}. This can happen if the "
+                    "database/schema/table is an unresolved macro or is missing. Falling back to a standard "
+                    "CREATE statement, which may fail if the object already exists."
+                )
+                return super().create_sql(create_expression)
 
-            database_name_exp = None
-            if hasattr(target, "catalog"):
-                database_name_exp = target.catalog
+            core_create_sql = super().create_sql(create_expression)
+            core_create_sql_literal = exp.Literal.string(core_create_sql)
 
-            core_create_sql = super().create_sql(expression)
-
-            if exists:
-                identifier_literal_sql = None
-                check_sql_expression = None
-                database_name_str = None
-
-                if database_name_exp:
-                    database_name_str = exp.to_identifier(database_name_exp).name
-
-                if not database_name_str:
-                    target_name_for_log = target.sql(dialect="tsql") if target else "unknown"
-                    logger.error(
-                        f"Expression for {kind} {target_name_for_log} is missing catalog information required for Fabric-specific IF NOT EXISTS check. The adapter/calling code must ensure the catalog is set on the expression."
-                    )
-                    return core_create_sql
-
-                if kind == "SCHEMA":
-                    schema_name_exp = target
-                    schema_name_str = None
-                    if schema_name_exp.db:
-                        schema_name_str = exp.to_identifier(schema_name_exp.db).name
-
-                    if schema_name_str:
-                        from_table = exp.Table(
-                            this=exp.to_identifier("SCHEMATA", quoted=True),
-                            db=exp.to_identifier("INFORMATION_SCHEMA", quoted=True),
-                            catalog=exp.to_identifier(database_name_str),
-                        )
-                        check_sql_expression = (
-                            exp.select("1")
-                            .from_(from_table)
-                            .where(
-                                exp.column("SCHEMA_NAME").eq(
-                                    self.sql(exp.Literal.string(schema_name_str.strip("[]")))
-                                )
-                            )
-                        )
-                        identifier_literal_sql = self.sql(exp.Literal.string(schema_name_str))
-
-                elif kind == "TABLE":
-                    schema_name_str = None
-                    if table_name_exp.db:
-                        schema_name_str = exp.to_identifier(table_name_exp.db).name
-
-                    table_name_str = None
-                    # FIXED: Check that table.name is not None before calling .upper()
-                    if table_name_exp.this and table_name_exp.this.name:
-                        table_name_str = exp.to_identifier(table_name_exp.this).name
-
-                    if table_name_str:
-                        from_table = exp.Table(
-                            this=exp.to_identifier("TABLES", quoted=True),
-                            db=exp.to_identifier("INFORMATION_SCHEMA", quoted=True),
-                            catalog=exp.to_identifier(database_name_str),
-                        )
-                        where_clauses = [
-                            exp.column("TABLE_NAME").eq(
-                                self.sql(exp.Literal.string(table_name_str.strip("[]")))
-                            )
-                        ]
-                        if schema_name_str:
-                            where_clauses.append(
-                                exp.column("TABLE_SCHEMA").eq(
-                                    self.sql(exp.Literal.string(schema_name_str.strip("[]")))
-                                )
-                            )
-
-                        check_sql_expression = (
-                            exp.select("1")
-                            .from_(from_table)
-                            .where(
-                                exp.and_(*where_clauses)
-                                if len(where_clauses) > 1
-                                else where_clauses[0]
-                            )
-                        )
-                        qualified_name_parts = [self.dialect.quote_identifier(database_name_str)]
-                        if schema_name_str:
-                            qualified_name_parts.append(
-                                self.dialect.quote_identifier(schema_name_str)
-                            )
-                        qualified_name_parts.append(self.dialect.quote_identifier(table_name_str))
-                        identifier_literal_sql = self.sql(
-                            exp.Literal.string(".".join(qualified_name_parts))
-                        )
-
-                elif kind == "INDEX":
-                    index_table_exp = expression.find(exp.Table)
-
-                    index_name = expression.this.text("this")
-
-                    table_schema_str = None
-                    table_name_str = None
-
-                    if index_table_exp and index_table_exp.db:
-                        table_schema_str = exp.to_identifier(index_table_exp.db).name
-                    if index_table_exp and index_table_exp.this and index_table_exp.this.name:
-                        table_name_str = exp.to_identifier(index_table_exp.this).name
-
-                    if table_name_str and index_name:
-                        from_table = exp.Table(
-                            this=exp.to_identifier("indexes", quoted=True),
-                            db=exp.to_identifier("sys", quoted=True),
-                            catalog=exp.to_identifier(database_name_str),
-                        )
-                        qualified_table_name_parts = [
-                            self.dialect.quote_identifier(database_name_str)
-                        ]
-                        if table_schema_str:
-                            qualified_table_name_parts.append(
-                                self.dialect.quote_identifier(table_schema_str)
-                            )
-                        qualified_table_name_parts.append(
-                            self.dialect.quote_identifier(table_name_str)
-                        )
-                        qualified_table_str = ".".join(qualified_table_name_parts)
-
-                        object_id_func = self.func(
-                            "object_id", exp.Literal.string(qualified_table_str)
-                        )
-
-                        check_sql_expression = (
-                            exp.select("1")
-                            .from_(from_table)
-                            .where(
-                                exp.and_(
-                                    exp.column("object_id").eq(object_id_func),
-                                    exp.column("name").eq(index_name),
-                                )
-                            )
-                        )
-                        identifier_literal_sql = self.sql(exp.Literal.string(qualified_table_str))
-
-                if identifier_literal_sql is not None and check_sql_expression is not None:
-                    check_sql_string = self.sql(check_sql_expression)
-
-                    core_create_sql_literal = self.sql(exp.Literal.string(core_create_sql))
-
-                    return f"""IF NOT EXISTS ({check_sql_string}) EXEC({core_create_sql_literal})"""
-                else:
-                    target_name_for_log = target.sql(dialect="tsql") if target else "unknown"
-                    logger.error(
-                        f"Could not build check SQL for {kind} {target_name_for_log} even with database name. Falling back to core CREATE."
-                    )
-                    return core_create_sql
-
-            return core_create_sql
+            return (
+                f"IF NOT EXISTS ({self.sql(check_sql)}) EXEC({self.sql(core_create_sql_literal)})"
+            )

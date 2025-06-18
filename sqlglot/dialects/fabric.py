@@ -5,8 +5,8 @@ import typing as t
 
 from sqlglot import exp, generator
 from sqlglot.dialects.tsql import TSQL  
-
-logger = logging.getLogger(__name__) 
+from sqlglot.dialects.dialect import NormalizationStrategy
+logger = logging.getLogger(__name__)
 
 
 class FABRIC(TSQL):
@@ -19,7 +19,7 @@ class FABRIC(TSQL):
     """
 
     DIALECT = "fabric"
-
+    NORMALIZATION_STRATEGY = NormalizationStrategy.CASE_SENSITIVE
     class Generator(TSQL.Generator):
         def table_sql(self, expression: exp.Table) -> str:
             catalog = expression.catalog
@@ -79,7 +79,7 @@ class FABRIC(TSQL):
 
 
                 if not database_name_str:
-                     target_name_for_log = target.sql(dialect='tsql') if target else 'unknown'
+                     target_name_for_log = target.sql(dialect='fabric') if target else 'unknown'
                      logger.error(f"Expression for {kind} {target_name_for_log} is missing catalog information required for Fabric-specific IF NOT EXISTS check. The adapter/calling code must ensure the catalog is set on the expression.")
                      return core_create_sql
 

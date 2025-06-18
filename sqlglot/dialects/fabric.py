@@ -21,6 +21,21 @@ class FABRIC(TSQL):
     DIALECT = "fabric"
     NORMALIZATION_STRATEGY = NormalizationStrategy.CASE_SENSITIVE
     class Generator(TSQL.Generator):
+        def datatype_sql(self, expression: exp.DataType) -> str:
+            """
+            Forces a precision of 6 for temporal types, as Fabric does not
+            support the default T-SQL precision of 7 in CAST statements.
+            """
+        
+            type_sql = super().datatype_sql(expression)
+
+            if type_sql.upper() in ("DATETIME2", "DATETIMEOFFSET"):
+                if "(" in type_sql:
+                    return f"{type_sql.split('(')[0]}(6)"
+                return f"{type_sql}(6)"
+
+            return type_sql
+
         def table_sql(self, expression: exp.Table) -> str:
             catalog = expression.catalog
             schema = expression.db
